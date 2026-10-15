@@ -15,7 +15,12 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           prompt: |
-            Give me a programming joke.
+            Give me a programming joke. Respond with a single valid JSON object and NOTHING ELSE.
+            The JSON must match this schema exactly:
+            {
+              "joke": "<a programming joke string>"
+            }
+            Provide a programming joke as the value of the "joke" key. Do not include any extra text, commentary, or delimiters.
 
       - name: Display AI Response
         run: |
