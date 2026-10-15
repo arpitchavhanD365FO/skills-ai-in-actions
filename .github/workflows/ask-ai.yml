@@ -10,45 +10,85 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Call GitHub Models API
-        id: ai
+      - name: Call GitHub Models API (robust)
+        id: call-model
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
-          curl -sS -X POST "https://models.github.ai/inference/chat/completions" \
+          OUT=/tmp/ai_response.json
+          # POST to the GitHub Models inference endpoint.
+          # response_format: {"type":"json_object"} requests structured output when supported.
+          http_code=$(curl -sS -o "$OUT" -w "%{http_code}" \
+            -X POST "https://models.github.ai/inference/chat/completions" \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Content-Type: application/json" \
             -d '{
               "model": "openai/gpt-4.1",
               "messages": [
-                {
-                  "role": "system",
-                  "content": "Return only valid JSON with a single key named joke."
-                },
-                {
-                  "role": "user",
-                  "content": "Give me a programming joke."
-                }
+                {"role":"system","content":"You are a helpful assistant. Return only a JSON object or plain text that is the joke. If you return JSON, it must be an object with a single key \"joke\" whose value is a string."},
+                {"role":"user","content":"Give me a programming joke."}
               ],
-              "response_format": {
-                "type": "json_object"
-              }
-            }' > /tmp/ai_response.json
+              "temperature": 0,
+              "response_format": {"type": "json_object"}
+            }')
 
-          python - <<'PY'
-          import json
-          try:
-              data = json.load(open('/tmp/ai_response.json'))
-              content = data["choices"][0]["message"]["content"]
-              obj = json.loads(content)
-              if not isinstance(obj, dict) or "joke" not in obj or not isinstance(obj["joke"], str):
-                  raise ValueError("Schema mismatch")
-              print(obj["joke"])
-          except Exception as e:
-              print("AI response was not valid JSON:", e)
-              print(open('/tmp/ai_response.json').read())
-              raise
-          PY
+          echo "HTTP status: $http_code"
+          echo "----- RAW RESPONSE -----"
+          cat "$OUT" || true
+          echo "------------------------"
+
+          if [ "$http_code" != "200" ] && [ "$http_code" != "201" ]; then
+            echo "ERROR: inference call returned HTTP $http_code"
+            echo "See raw response above"
+            exit 1
+          fi
+
+          # Try to extract assistant content: choices[0].message.content
+          # (Some model responses place the assistant text in different fields; adjust if necessary.)
+          content=$(jq -r '.choices[0].message.content // empty' "$OUT" 2>/dev/null || true)
+
+          if [ -z "$content" ]; then
+            echo "ERROR: no choices[0].message.content found in response — dumping raw response for debugging:"
+            cat "$OUT"
+            exit 1
+          fi
+
+          echo "----- ASSISTANT CONTENT -----"
+          printf '%s\n' "$content"
+          echo "-----------------------------"
+
+          # First try to parse the assistant content as JSON and extract the "joke" field.
+          joke=$(printf '%s' "$content" | jq -r '.joke // empty' 2>/dev/null || true)
+
+          if [ -n "$joke" ]; then
+            echo "Extracted joke from JSON content."
+            printf '%s' "$joke" > /tmp/joke.txt
+            echo "joke_source=json" >> $GITHUB_OUTPUT
+          else
+            # Fallback: treat assistant content as plain text — sanitize and use it directly.
+            # Remove leading/trailing quotes and whitespace if present.
+            plain=$(printf '%s' "$content" | sed -E 's/^[[:space:]]+"//; s/"[[:space:]]*$//; s/^[[:space:]]+//; s/[[:space:]]+$//')
+            if [ -z "$plain" ]; then
+              echo "ERROR: assistant content is present but empty after sanitization."
+              echo "Assistant content was:"
+              printf '%s\n' "$content"
+              exit 1
+            fi
+            echo "Using assistant content as plain text fallback."
+            printf '%s' "$plain" > /tmp/joke.txt
+            echo "joke_source=plain" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Display AI Response
+        shell: bash
+        run: |
+          echo "## 🤖 AI Response" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f /tmp/joke.txt ]; then
+            cat /tmp/joke.txt >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No valid joke was extracted. See previous logs for raw response."
+          fi
