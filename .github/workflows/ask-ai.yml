@@ -3,79 +3,90 @@ on:
   workflow_dispatch:
 
 permissions:
-  models: read
+  contents: read
 
 jobs:
   ask-ai:
     runs-on: ubuntu-latest
     steps:
-      - name: Call GitHub Models API (full debug)
-        id: call-model
+      - name: Call OpenAI Chat API (robust + debug)
+        id: call-openai
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           set -euo pipefail
-          OUT_RAW=/tmp/ai_response.raw
-          OUT_BODY=/tmp/ai_response.body
-          OUT_STATUS=/tmp/ai_response.status
 
-          # Perform the POST and capture headers + body. -i includes headers in output,
-          # -sS shows errors, -w captures status code to file.
-          # Adjust URL if your environment requires a different base.
-          curl -i -sS -X POST "https://models.github.ai/inference/chat/completions" \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
+          OUT=/tmp/ai_response.json
+
+          # Choose your model: change to "gpt-4" if you have access
+          MODEL="gpt-3.5-turbo"
+
+          http_code=$(curl -sS -o "$OUT" -w "%{http_code}" \
+            -X POST "https://api.openai.com/v1/chat/completions" \
+            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
             -H "Content-Type: application/json" \
             -d '{
-              "model": "openai/gpt-4.1",
+              "model": "'"$MODEL"'",
               "messages": [
-                {"role":"system","content":"You are a helpful assistant. Return only a JSON object with key \"joke\" or, if not possible, return plain text containing the joke."},
+                {"role":"system","content":"You are a helpful assistant. Respond with ONLY a single valid JSON object and nothing else. The JSON must be: {\"joke\":\"<a programming joke>\"}"},
                 {"role":"user","content":"Give me a programming joke."}
               ],
               "temperature": 0
-            }' \
-            -o "$OUT_RAW" -w "%{http_code}" > "$OUT_STATUS" || true
+            }')
 
-          status=$(cat "$OUT_STATUS" || true) || status="(none)"
-          # Separate headers and body: assume headers end at first blank line
-          awk 'BEGIN{h=1} h==1{print > "'"$OUT_RAW"'.tmp"; if($0== "") h=0; next} {print > "'"$OUT_BODY"'}' "$OUT_RAW" || true
-          # If awk separation failed, copy raw to body
-          if [ ! -s "$OUT_BODY" ]; then
-            cat "$OUT_RAW" > "$OUT_BODY"
+          echo "HTTP status: $http_code"
+          echo "----- RAW RESPONSE -----"
+          cat "$OUT" || true
+          echo "------------------------"
+
+          if [ "$http_code" != "200" ] && [ "$http_code" != "201" ]; then
+            echo "ERROR: API call returned HTTP $http_code"
+            exit 1
           fi
 
-          echo "HTTP status: $status"
-          echo "----- RAW RESPONSE (headers + body) -----"
-          cat "$OUT_RAW" || true
-          echo "----- SEPARATED BODY -----"
-          cat "$OUT_BODY" || true
-          echo "-----------------------------------------"
+          # Extract assistant content
+          content=$(jq -r '.choices[0].message.content // empty' "$OUT" 2>/dev/null || true)
 
-          # Quick attempts to find JSON in body
-          if jq -e . "$OUT_BODY" >/dev/null 2>&1; then
-            echo "Body is JSON. Saving to /tmp/ai_response.json"
-            cp "$OUT_BODY" /tmp/ai_response.json
+          if [ -z "$content" ]; then
+            echo "ERROR: no choices[0].message.content found in response — dumping raw response for debugging:"
+            cat "$OUT"
+            exit 1
+          fi
+
+          echo "----- ASSISTANT CONTENT -----"
+          printf '%s\n' "$content"
+          echo "-----------------------------"
+
+          # Try to parse assistant content as JSON and pull "joke"
+          joke=$(printf '%s' "$content" | jq -r '.joke // empty' 2>/dev/null || true)
+
+          if [ -n "$joke" ]; then
+            echo "Extracted joke from JSON content."
+            printf '%s' "$joke" > /tmp/joke.txt
+            echo "joke_source=json" >> $GITHUB_OUTPUT
           else
-            echo "Body does not appear to be JSON."
+            # Fallback: use assistant content as plain text (sanitize surrounding quotes)
+            plain=$(printf '%s' "$content" | sed -E 's/^[[:space:]]+"//; s/"[[:space:]]*$//; s/^[[:space:]]+//; s/[[:space:]]+$//')
+            if [ -z "$plain" ]; then
+              echo "ERROR: assistant content is present but empty after sanitization."
+              echo "Assistant content was:"
+              printf '%s\n' "$content"
+              exit 1
+            fi
+            echo "Using assistant content as plain text fallback."
+            printf '%s' "$plain" > /tmp/joke.txt
+            echo "joke_source=plain" >> $GITHUB_OUTPUT
           fi
 
-          # Try to extract choices[0].message.content if present
-          content=$(jq -r '.choices[0].message.content // empty' /tmp/ai_response.json 2>/dev/null || true)
-          if [ -n "$content" ]; then
-            echo "Extracted assistant content:"
-            printf '%s\n' "$content"
-            printf '%s' "$content" > /tmp/assistant_content.txt
-          else
-            echo "No choices[0].message.content found."
-          fi
-
-          # Exit non-zero so the run is obvious to review (optional).
-          # Comment this out if you prefer the workflow to succeed even for debugging.
-          exit 1
-
-      - name: Display AI Response (summary)
+      - name: Display AI Response
         if: always()
+        shell: bash
         run: |
-          echo "## 🤖 Raw AI Response" >> "$GITHUB_STEP_SUMMARY"
+          echo "## 🤖 AI Response" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "See workflow logs for the full raw response (headers + body)."
+          if [ -f /tmp/joke.txt ]; then
+            cat /tmp/joke.txt >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No valid joke was extracted. See previous logs for raw response."
+          fi
