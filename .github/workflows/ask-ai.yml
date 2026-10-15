@@ -17,12 +17,31 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           model: openai/gpt-4.1
           prompt: |
-            Give me a programming joke.
+            Return only a single valid JSON object in this format:
+            {"joke":"<a programming joke>"}
+            Do not include any markdown, preamble, or explanations.
+
+      - name: Validate AI response
+        run: |
+          echo "${{ steps.ai-response.outputs.response }}" > /tmp/ai_response.json
+          python - <<'PY'
+          import json, sys
+          try:
+              data = json.load(open('/tmp/ai_response.json', 'r', encoding='utf-8'))
+          except Exception as e:
+              print(f'AI output was not valid JSON: {e}')
+              sys.exit(1)
+          if not isinstance(data, dict) or 'joke' not in data or not isinstance(data['joke'], str):
+              print('AI output did not match expected schema: {"joke": "..."}')
+              sys.exit(1)
+          print('AI response OK')
+          PY
 
       - name: Display AI Response
-        env:
-          AI_RESPONSE: ${{ steps.ai-response.outputs.response }}
         run: |
           echo "## 🤖 AI Response" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "$AI_RESPONSE" >> "$GITHUB_STEP_SUMMARY"
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          print(json.load(open('/tmp/ai_response.json'))['joke'])
+          PY
